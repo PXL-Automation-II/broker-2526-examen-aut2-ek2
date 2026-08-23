@@ -1,0 +1,199 @@
+# PXL Classroom - broker acceptance handler.
+#
+# SECURITY MODEL:
+# This workflow lives on a PUBLIC broker repo's default branch (one per assignment).
+# Acceptance is triggered by a public event on a public repository, so anyone can
+# ring the doorbell. What stops an outsider from causing work is the SIGNED
+# INVITATION TOKEN in the issue title: it is verified here, from a checkout of the
+# public hub, BEFORE any credential is in scope. A caller without a valid token
+# costs one boot on a free public runner - no App token minted, no hub run, no
+# clone of the private control repo.
+#
+# The verifier is public, which is why the signature is asymmetric. Only the
+# PUBLIC key is readable here (hub: acceptance/invite-keys.json); the signing key
+# never leaves the hub. See ARCHITECTURE §4.3.2 and lib/invite-token.mjs.
+#
+# NO ATTACKER-CONTROLLED TEXT MAY REACH A SHELL HERE. This repository carries
+# PXL_APP_PRIVATE_KEY as a repo secret, and any GitHub account can open an issue
+# on it. An issue body interpolated into `run:` was arbitrary code execution
+# against that key. Every value below is passed through `env:` - never `${{ }}`
+# inside a script - and the issue BODY is never read here at all: the hub fetches
+# and validates it (scripts/read-team-payload.mjs). See ARCHITECTURE §4.3.1.
+#
+# Secrets required:
+#   PXL_APP_CLIENT_ID      - Provisioning App Client ID (Iv… string)
+#   PXL_APP_PRIVATE_KEY    - Provisioning App private key (PEM)
+#
+# Variables required (all set by publish-assignment.yml):
+#   ASSIGNMENT_ID          - the assignment this broker accepts for
+#   CONTROL_ORG            - e.g. "PXLAutomation" (the org owning the control repo)
+#   INVITE_NONCE           - current invitation generation; rotating it retires
+#                            every link issued before it
+#   INVITE_ENABLED         - "false" turns acceptance off without deleting anything
+
+name: Acceptance trigger
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: accept-${{ github.actor }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    # Evaluated BEFORE a runner is allocated. An issue that is not an acceptance
+    # attempt, or an assignment whose invitations are switched off, is skipped
+    # without consuming a runner at all.
+    if: >-
+      github.event.action == 'opened'
+      && startsWith(github.event.issue.title, 'pxl-accept:')
+      && vars.INVITE_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate actor
+        id: validate
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.event.sender.id }}
+        run: |
+          [[ -n "$ACTOR" && -n "$ACTOR_ID" ]] \
+            || { echo "::error::Missing actor"; exit 1; }
+          [[ "$ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] \
+            || { echo "::error::Actor is not a valid GitHub login"; exit 1; }
+          [[ "$ACTOR_ID" =~ ^[0-9]+$ ]] \
+            || { echo "::error::Actor id is not numeric"; exit 1; }
+          {
+            echo "actor=$ACTOR"
+            echo "actor_id=$ACTOR_ID"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Parse invitation title
+        id: parse
+        shell: bash
+        env:
+          # Read through env, never interpolated into this script. A bash regex
+          # match against an env var cannot break out the way a substituted
+          # `${{ }}` value can.
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          TOKEN=""
+          HINT=""
+          NUMBER=""
+          # pxl-accept:<token>[ team:<slug>] - nothing else is accepted.
+          RE='^pxl-accept:([A-Za-z0-9_-]{35}\.[A-Za-z0-9_-]{86})( team:([a-z0-9][a-z0-9-]{0,63}))?$'
+          if [[ "$ISSUE_TITLE" =~ $RE ]]; then
+            TOKEN="${BASH_REMATCH[1]}"
+            HINT="${BASH_REMATCH[3]}"
+          fi
+          if [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            NUMBER="$ISSUE_NUMBER"
+          fi
+          {
+            echo "token=$TOKEN"
+            echo "team_hint=$HINT"
+            echo "number=$NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+      # Public repository, no credentials. This is the only third-party action
+      # in the pre-verification path, and the runner's own Node runs the
+      # verifier - lib/invite-token.mjs is Node-builtin-only precisely so that
+      # no `npm ci` is needed on a credential-bearing public repository.
+      - name: Check out the hub
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: PXL-Digital-Application-Samples/pxl-classroom
+          ref: main
+          path: hub
+          persist-credentials: false
+
+      - name: Verify invitation token
+        id: verify
+        shell: bash
+        env:
+          TOKEN: ${{ steps.parse.outputs.token }}
+          ORG: ${{ vars.CONTROL_ORG }}
+          ASSIGNMENT_ID: ${{ vars.ASSIGNMENT_ID }}
+          INVITE_NONCE: ${{ vars.INVITE_NONCE }}
+          KEYS_FILE: hub/acceptance/invite-keys.json
+        run: node hub/scripts/verify-invite-token.mjs
+
+      - name: Reject invalid invitation
+        if: steps.verify.outputs.valid != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout of this repo, so gh has no remote to infer it from.
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          REASON: ${{ steps.verify.outputs.reason }}
+        run: |
+          echo "::notice::Invitation rejected (${REASON}) - no credential was used"
+          [ -n "$ISSUE_NUMBER" ] || exit 0
+          # Deliberately generic: the precise reason stays in this run's log
+          # rather than becoming a probing oracle on a public repository.
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "This invitation link is not valid for this assignment, or is no longer current. Ask your lecturer for an up-to-date link." || true
+          gh issue close "$ISSUE_NUMBER" --reason "not planned" || true
+          gh issue lock "$ISSUE_NUMBER" --reason "resolved" || true
+
+      - name: Mint dispatcher token
+        if: steps.verify.outputs.valid == 'true'
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.PXL_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PXL_APP_PRIVATE_KEY }}
+          owner: PXL-Digital-Application-Samples
+          repositories: pxl-classroom
+
+      - name: Dispatch to central pxl-classroom
+        if: steps.verify.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          CONTROL_ORG: ${{ vars.CONTROL_ORG }}
+          ASSIGNMENT_ID: ${{ vars.ASSIGNMENT_ID }}
+          ACTOR: ${{ steps.validate.outputs.actor }}
+          ACTOR_ID: ${{ steps.validate.outputs.actor_id }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          TEAM_HINT: ${{ steps.parse.outputs.team_hint }}
+          BROKER_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ARGS=(
+            "/repos/PXL-Digital-Application-Samples/pxl-classroom/dispatches"
+            -f "event_type=acceptance"
+            -f "client_payload[org]=$CONTROL_ORG"
+            -f "client_payload[assignment_id]=$ASSIGNMENT_ID"
+            -f "client_payload[github_login]=$ACTOR"
+            -f "client_payload[github_id]=$ACTOR_ID"
+            -f "client_payload[broker_repo]=$BROKER_REPO"
+            -f "client_payload[workflow_run_url]=$RUN_URL"
+          )
+          if [ -n "$ISSUE_NUMBER" ]; then
+            ARGS+=(-f "client_payload[issue_number]=$ISSUE_NUMBER")
+          fi
+          if [ -n "$TEAM_HINT" ]; then
+            ARGS+=(-f "client_payload[team_hint]=$TEAM_HINT")
+          fi
+          gh api --method POST "${ARGS[@]}"
+
+      - name: Clean up trigger issue
+        if: always() && steps.verify.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+        run: |
+          [ -n "$ISSUE_NUMBER" ] || exit 0
+          gh issue close "$ISSUE_NUMBER" --reason "completed" || true
+          gh issue lock "$ISSUE_NUMBER" --reason "resolved" || true
