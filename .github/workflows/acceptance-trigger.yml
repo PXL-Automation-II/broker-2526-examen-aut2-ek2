@@ -13,16 +13,41 @@
 # PUBLIC key is readable here (hub: acceptance/invite-keys.json); the signing key
 # never leaves the hub. See ARCHITECTURE §4.3.2 and lib/invite-token.mjs.
 #
-# NO ATTACKER-CONTROLLED TEXT MAY REACH A SHELL HERE. This repository carries
-# PXL_APP_PRIVATE_KEY as a repo secret, and any GitHub account can open an issue
-# on it. An issue body interpolated into `run:` was arbitrary code execution
-# against that key. Every value below is passed through `env:` - never `${{ }}`
-# inside a script - and the issue BODY is never read here at all: the hub fetches
-# and validates it (scripts/read-team-payload.mjs). See ARCHITECTURE §4.3.1.
+# NO ATTACKER-CONTROLLED TEXT MAY REACH A SHELL HERE. This repository carries a
+# credential and any GitHub account can open an issue on it, so an issue body
+# interpolated into `run:` is code execution beside that credential. Every value
+# below is passed through `env:` - never `${{ }}` inside a script - and the issue
+# BODY is never read here at all: the hub fetches and validates it
+# (scripts/read-team-payload.mjs). See ARCHITECTURE §4.3.1.
+#
+# The rule has not softened now that the credential is the narrow broker App
+# rather than the provisioning App's key. It is still a credential on a public
+# repository, and the rule is about what may reach a shell - not about how much
+# the thing in scope is worth.
 #
 # Secrets required:
-#   PXL_APP_CLIENT_ID      - Provisioning App Client ID (Iv… string)
-#   PXL_APP_PRIVATE_KEY    - Provisioning App private key (PEM)
+#   PXL_BROKER_CLIENT_ID   - BROKER App Client ID (Iv… string)
+#   PXL_BROKER_PRIVATE_KEY - BROKER App private key (PEM)
+#
+# THE BROKER APP IS NOT THE PROVISIONING APP, and the distinction is the whole
+# point. This repository is PUBLIC, there is one per assignment, and it used to
+# hold PXL_APP_PRIVATE_KEY - the provisioning App's own key. Measured
+# 2026-08-31, that key was on 11 public repositories across 8 organizations, and
+# it mints tokens carrying administration=write, organization_administration=
+# write, members=write, secrets=write, workflows=write and contents=write on
+# every org the App is installed on. Anyone with admin on one course org could
+# push a workflow here and read it out, which made a lecturer scoped to one
+# course an administrator of all twelve.
+#
+# The broker App is installed on the HUB REPOSITORY ALONE and holds Contents:
+# write alone - exactly what POST /repos/{o}/{r}/dispatches requires and nothing
+# else. If this key leaks, what it buys is the ability to submit an acceptance
+# to the hub, which the signature check below already bounds. It has no
+# `actions: write`, so it cannot dispatch a hub workflow either.
+#
+# Scoping the minted TOKEN (`owner:` + `repositories:` + `permission-contents:`)
+# is defence in depth. The secret is the thing that is stored, and narrowing
+# THAT is what actually reduced the blast radius.
 #
 # Variables required (all set by publish-assignment.yml):
 #   ASSIGNMENT_ID          - the assignment this broker accepts for
@@ -33,7 +58,7 @@
 #                            base64url). Public by design. The student signs with
 #                            the private half, which lives only in their link, so
 #                            the title carries a signature rather than a
-#                            credential - see CLAIM_PLAN Phase A. Absent means
+#                            credential - see ARCHITECTURE §4.3.2. Absent means
 #                            reject, never "accept anything"
 #   INVITE_ENABLED         - "false" turns acceptance off without deleting anything
 
@@ -181,10 +206,13 @@ jobs:
         id: token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.PXL_APP_CLIENT_ID }}
-          private-key: ${{ secrets.PXL_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.PXL_BROKER_CLIENT_ID }}
+          private-key: ${{ secrets.PXL_BROKER_PRIVATE_KEY }}
           owner: PXL-Digital-Application-Samples
           repositories: pxl-classroom
+          # The single permission a repository_dispatch needs. Stated explicitly
+          # so the token stays minimal even if the broker App is ever widened.
+          permission-contents: write
 
       - name: Dispatch to central pxl-classroom
         if: steps.verify.outputs.valid == 'true'
